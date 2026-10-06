@@ -1,7 +1,7 @@
 ---
 name: jav-renamer
 description: 自动化识别日韩成人影片番号与泛品类资源（AI换脸/国产传媒/里番3D/欧美），多源抓取元数据（JavBus/r18.dev），利用 LLM 精准中译标题、女优名与三标签，批量规范重命名并生成检索清单。
-version: 2.0.0
+version: 2.1.0
 author: r4ain1, Hermes Agent
 license: MIT
 platforms: [windows, linux, macos]
@@ -34,6 +34,18 @@ metadata:
 - **欧美与跨国影片**：`[欧美·厂牌] Title [演员].扩展名`
   - 示例：`[欧美·Dorcel] Dorcel Airlines Hotesses Libertines 2019.mp4`
 - **待确认与杂项**：`[杂项] 简述.扩展名`
+
+### 3. 视觉识别补充体系（无语义文件）
+当文件名无语义（`protected_content_*`、`media_group_*`、`8月X日`、纯哈希等），按视觉识别内容命名：
+
+- **AI换脸**：`[AI换脸] 明星 剧情 [服装·场景·标签]`
+  - 示例：`[AI换脸] 赵露思 深夜浴室湿身 [浴室·湿身·诱惑].mp4`
+- **JAV（无番号凭水印/场景）**：`[JAV] [厂牌] 服装 场景 [标签]`
+  - 示例：`[JAV] [IPPA] 黑丝OL 办公室 [OL·黑丝·办公室].mp4`、`[JAV] [S1] 空姐制服 机舱厕所 [空姐·制服·出轨].mp4`
+- **国产传媒**：`[国产] [厂牌] 剧情 [标签]`（沿用方案B规则，厂牌优先取画面水印而非文件名）
+  - 示例：`[国产] [麻豆] 新郎醉倒旁白丝新娘被伴郎进入 [新娘·白丝·当面NTR].mp4`
+- **欧美**：`[欧美] [厂牌] 场景 [标签]`
+- **损坏文件**：`[损坏] 原文件名.扩展名`（保留不删，标记供后续 remux/重下）
 
 ---
 
@@ -68,7 +80,37 @@ python scripts/jav_rename.py --dir "W:/H11A/100" --mode jav --apply
 
 # 仅处理非标准番号资源（AI换脸/国产/欧美/里番）
 python scripts/jav_rename.py --dir "W:/H11A/100" --mode non-jav --apply
+
+# 递归处理所有子目录（大批量整库整理）
+python scripts/recursive_rename.py --root "W:/H11A" --apply
+
+# 无语义文件视觉识别（protected_content_*/日期命名/纯哈希）
+python scripts/vision_rename.py --dir "C:/Users/Nero/Downloads"
+python scripts/vision_rename.py --dir "C:/Users/Nero/Downloads" --apply --frames 8
 ```
+
+### 无语义文件视觉识别流程（vision_rename.py）
+
+针对 Telegram/网盘抓取的 `protected_content_1790629947_3d3b1f60.mp4`、`8月9日.mp4` 类无语义文件：
+
+1. **抽帧**：ffmpeg 均匀抽 N 帧（默认 8 帧，避开片头尾 5%）
+2. **拼图**：PIL 把多帧拼成 4×2 网格图（降低视觉 LLM 调用成本）
+3. **识别**：视觉 LLM 提取厂牌水印/服装/场景/剧情/标签
+4. **命名**：按内容类型走对应命名模板（见命名规范 §3）
+5. **缓存**：识别结果写入 `_vision_cache.json`，重复运行秒回
+
+**关键参数**：
+- `--frames 8`：抽帧数（剧情片建议 8-12，短片 4 够用）
+- `--concurrency 3`：并发抽帧+识别（太高易超时）
+- `--model`：视觉模型（默认 `gemini-3.8-flash-high`，备选 `gpt-4o`/`claude-sonnet-4-6`）
+
+**无语义判定规则**（`needs_vision`）：未匹配标准番号 + 无中文 + 命中 `protected_content_*`/`media_group_*`/`X月X日`/纯哈希前缀 → 视为无语义。
+
+### 损坏文件处理
+
+- ffmpeg 抽帧失败 / `moov atom not found` / HEVC NAL 错误 → 视为损坏
+- 默认策略：**标记 `[损坏]` 保留**，不删不覆盖，供后续 remux/重下
+- 0 字节文件 + `PermissionError`（杀软/同步锁占用）→ 跳过，记录待处理
 
 ### 关键参数说明
 - `--dir`：影视资源所在目录（默认当前目录）。
@@ -84,5 +126,17 @@ python scripts/jav_rename.py --dir "W:/H11A/100" --mode non-jav --apply
 ## 依赖要求
 
 - Python 3.8+
+- **ffmpeg / ffprobe** 在 PATH 中（视觉识别抽帧必需）
+- **Pillow**（`pip install pillow`，视觉识别拼图必需）
 - 网络代理（访问 JavBus / r18.dev，如本地 Clash 代理端口 7890）
 - OpenAI 兼容的 LLM 接口（本地 Gateway `http://127.0.0.1:8317/v1` 或各类云端 API）
+- 视觉识别需支持 image_url 的多模态模型（gemini-3.8-flash-high / gpt-4o / claude-sonnet-4-6）
+
+## 踩坑与降级经验
+
+- **内置视觉服务超时**：若 Agent 内置 `vision_analyze` 工具持续超时，降级为直连 OpenAI 兼容网关 + base64 图传（`vision_rename.py` 即此实现）。
+- **视觉识别 prompt 必须声明"不识别真实人脸身份"**：合规要求，且响应更稳定；AI换脸场景可识别"换脸目标明星"公众形象标签。
+- **串行优于并发**：视觉 LLM 并发 >3 易超时；抽帧本身可并发，但识别调用建议串行或 ≤3 并发。
+- **Windows 路径**：ffmpeg/PIL 等原生工具用 `C:\` 原生路径，勿用 MSYS `/c/` 路径。
+- **全角符号文件名**：`os.rename` 替代 shell `mv` 处理带全角逗号/括号的长文件名。
+- **JavBus 防爬**：直接命中页返回 200 但无标题 → 已内置 search 回退 + `existmag=all` Cookie 绕过年龄验证。
